@@ -1,0 +1,1138 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ */
+
+#include <linux/clk.h>
+#include <linux/ethtool.h>
+#include <linux/if_vlan.h>
+#include <linux/interrupt.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/of_platform.h>
+#include <linux/property.h>
+#include <linux/reset.h>
+#include "qca_edma.h"
+
+
+static inline u32 edma_r32(struct edma *edma, u32 reg)
+{
+	return readl(edma->reg_base + reg);
+}
+
+static inline void edma_w32(struct edma *edma, u32 val, u32 reg)
+{
+	writel(val, edma->reg_base + reg);
+}
+
+static inline void edma_m32(struct edma *edma, u32 mask, u32 set, u32 reg)
+{
+	u32 val;
+
+	val = edma_r32(edma, reg);
+	val &= ~mask;
+	val |= set;
+	edma_w32(edma, val, reg);
+}
+
+static void edma_irq_disable_all(struct edma *edma)
+{
+	int i;
+
+	for (i = 0; i <= edma->soc->txdesc_ring; i++)
+		edma_w32(edma, 0, EDMA_REG_TX_INT_MASK(edma->soc->tx_int_base, i));
+
+	for (i = 0; i <= edma->soc->rxfill_ring; i++)
+		edma_w32(edma, 0, EDMA_REG_RXFILL_INT_MASK(i));
+
+	for (i = 0; i <= edma->soc->rxdesc_ring; i++) {
+		edma_w32(edma, 0, EDMA_REG_RXDESC_INT_MASK(i));
+		edma_w32(edma, 0, EDMA_REG_RX_INT_CTRL(i));
+	}
+}
+
+static void edma_tx_irq_mask(struct edma *edma)
+{
+	edma_w32(edma, 0,
+		 EDMA_REG_TX_INT_MASK(edma->soc->tx_int_base, edma->soc->txcmpl_ring));
+}
+
+static void edma_tx_irq_unmask(struct edma *edma)
+{
+	edma_w32(edma, EDMA_TX_INT_MASK,
+		 EDMA_REG_TX_INT_MASK(edma->soc->tx_int_base, edma->soc->txcmpl_ring));
+}
+
+static void edma_rx_irq_mask(struct edma *edma)
+{
+	edma_w32(edma, 0, EDMA_REG_RXFILL_INT_MASK(edma->soc->rxfill_ring));
+	edma_w32(edma, 0, EDMA_REG_RXDESC_INT_MASK(edma->soc->rxdesc_ring));
+}
+
+static void edma_rx_irq_unmask(struct edma *edma)
+{
+	edma_w32(edma, EDMA_RXFILL_INT_MASK,
+		 EDMA_REG_RXFILL_INT_MASK(edma->soc->rxfill_ring));
+	edma_w32(edma, EDMA_RXDESC_INT_MASK_PKT_INT,
+		 EDMA_REG_RXDESC_INT_MASK(edma->soc->rxdesc_ring));
+}
+
+static irqreturn_t edma_tx_irq_handle(int irq, void *ctx)
+{
+	struct edma *edma = ctx;
+
+	if (!edma_r32(edma, EDMA_REG_TX_INT_STAT(edma->soc->tx_int_base, edma->soc->txcmpl_ring)))
+		return IRQ_NONE;
+
+	edma_tx_irq_mask(edma);
+
+	if (likely(napi_schedule_prep(&edma->tx_napi)))
+		__napi_schedule(&edma->tx_napi);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t edma_rx_irq_handle(int irq, void *ctx)
+{
+	struct edma *edma = ctx;
+	u32 status = 0;
+
+	status |= edma_r32(edma, EDMA_REG_RXDESC_INT_STAT(edma->soc->rxdesc_ring));
+	status |= edma_r32(edma, EDMA_REG_RXFILL_INT_STAT(edma->soc->rxfill_ring));
+
+	if (!status)
+		return IRQ_NONE;
+
+	edma_rx_irq_mask(edma);
+
+	if (likely(napi_schedule_prep(&edma->rx_napi)))
+		__napi_schedule(&edma->rx_napi);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t edma_misc_irq_handle(int irq, void *ctx)
+{
+	struct edma *edma = ctx;
+
+	if (!edma_r32(edma, EDMA_REG_MISC_INT_STAT))
+		return IRQ_NONE;
+
+	return IRQ_HANDLED;
+}
+
+static int edma_ring_alloc(struct edma *edma, struct edma_ring *ring, int count,
+			   int desc_size)
+{
+	struct device *dev = &edma->pdev->dev;
+
+	ring->count = count;
+	ring->desc = dma_alloc_coherent(dev, count * desc_size, &ring->dma,
+					GFP_KERNEL);
+	if (!ring->desc)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static int edma_tx_ring_alloc(struct edma *edma, struct edma_ring *ring,
+			      int count, int desc_size)
+{
+	int ret;
+
+	ret = edma_ring_alloc(edma, ring, count, desc_size);
+	if (ret)
+		return ret;
+
+	ring->skb_store = kcalloc(count, sizeof(struct sk_buff *), GFP_KERNEL);
+	if (!ring->skb_store) {
+		dma_free_coherent(&edma->pdev->dev, count * desc_size,
+				  ring->desc, ring->dma);
+		ring->desc = NULL;
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void edma_ring_free(struct edma *edma, struct edma_ring *ring,
+			   int desc_size)
+{
+	if (ring->desc) {
+		dma_free_coherent(&edma->pdev->dev, ring->count * desc_size,
+				  ring->desc, ring->dma);
+		ring->desc = NULL;
+	}
+}
+
+static void edma_tx_ring_free(struct edma *edma, struct edma_ring *ring,
+			      int desc_size)
+{
+	int i;
+
+	if (ring->skb_store) {
+		for (i = 0; i < ring->count; i++)
+			dev_kfree_skb_any(ring->skb_store[i]);
+		kfree(ring->skb_store);
+		ring->skb_store = NULL;
+	}
+
+	edma_ring_free(edma, ring, desc_size);
+}
+
+static int edma_rx_fill(struct edma *edma, struct edma_ring *rxfill_ring)
+{
+	struct edma_rxfill_desc *rxfill_desc;
+	u16 prod, cons, next;
+	struct page *page;
+	u16 filled = 0;
+	dma_addr_t dma;
+
+	prod = edma_r32(edma, EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring));
+	prod &= EDMA_RXFILL_PROD_IDX_MASK & (rxfill_ring->count - 1);
+
+	cons = edma_r32(edma, EDMA_REG_RXFILL_CONS_IDX(edma->soc->rxfill_ring));
+	cons &= EDMA_RXFILL_CONS_IDX_MASK & (rxfill_ring->count - 1);
+
+	while (1) {
+		next = prod + 1;
+		if (next == rxfill_ring->count)
+			next = 0;
+
+		if (next == cons)
+			break;
+
+		page = page_pool_dev_alloc_pages(edma->page_pool);
+		if (unlikely(!page))
+			break;
+
+		rxfill_desc = EDMA_RXFILL_DESC(rxfill_ring, prod);
+
+		dma = page_pool_get_dma_addr(page) + NET_SKB_PAD;
+		rxfill_desc->buffer_addr = cpu_to_le32(dma);
+		rxfill_desc->word1 = cpu_to_le32(EDMA_RX_BUFFER_SIZE &
+						 EDMA_RXFILL_BUF_SIZE_MASK);
+
+		filled++;
+		prod = next;
+	}
+
+	if (filled) {
+		wmb();
+		edma_w32(edma, prod & EDMA_RXFILL_PROD_IDX_MASK,
+			 EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring));
+	}
+
+	return filled;
+}
+
+static u32 edma_clean_tx(struct edma *edma, struct edma_ring *txcmpl_ring,
+			 int budget)
+{
+	struct platform_device *pdev = edma->pdev;
+	struct edma_txcmpl *txcmpl;
+	struct edma_txdesc *txdesc;
+	u32 cleaned = 0, bytes = 0;
+	u16 prod, cons;
+	struct sk_buff *skb;
+	int idx;
+	u32 len;
+
+	prod = edma_r32(edma, EDMA_REG_TXCMPL_PROD_IDX(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
+	prod &= EDMA_TXCMPL_PROD_IDX_MASK;
+
+	cons = edma_r32(edma, EDMA_REG_TXCMPL_CONS_IDX(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
+	cons &= EDMA_TXCMPL_CONS_IDX_MASK;
+
+	while (cons != prod && cleaned < budget) {
+		txcmpl = EDMA_TXCMPL_DESC(txcmpl_ring, cons);
+
+		idx = txcmpl->buffer_addr;
+		skb = edma->txdesc_ring.skb_store[idx];
+		edma->txdesc_ring.skb_store[idx] = NULL;
+
+		if (unlikely(!skb)) {
+			dev_warn(&pdev->dev,
+				 "invalid skb: cons:%u prod:%u status %x\n",
+				 cons, prod, txcmpl->status);
+			goto next;
+		}
+
+		txdesc = EDMA_TXDESC_DESC(&edma->txdesc_ring, idx);
+		len = skb_headlen(skb);
+
+		dma_unmap_single(&pdev->dev,
+				 le32_to_cpu(txdesc->buffer_addr),
+				 len, DMA_TO_DEVICE);
+		bytes += len - EDMA_TX_PREHDR_SIZE;
+		napi_consume_skb(skb, budget);
+
+next:
+		if (++cons == txcmpl_ring->count)
+			cons = 0;
+
+		cleaned++;
+	}
+
+	if (cleaned == 0)
+		return 0;
+
+	netdev_tx_completed_queue(netdev_get_tx_queue(edma->netdev, 0), cleaned,
+				  bytes);
+
+	/* Ensure all TX completions are processed before updating cons idx */
+	wmb();
+	edma_w32(edma, cons, EDMA_REG_TXCMPL_CONS_IDX(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
+
+	return cleaned;
+}
+
+static u32 edma_clean_rx(struct edma *edma, int budget,
+			 struct edma_ring *rxdesc_ring)
+{
+	struct platform_device *pdev = edma->pdev;
+	struct dsa_oob_tag_info *tag_info;
+	struct edma_rx_preheader *rxph;
+	struct edma_rxdesc *rxdesc;
+	struct sk_buff *skb;
+	u16 prod, cons;
+	struct page *page;
+	u32 done = 0;
+	u32 src_port;
+	int pkt_len;
+
+	prod = edma_r32(edma, EDMA_REG_RXDESC_PROD_IDX(edma->soc->rxdesc_ring));
+	prod &= EDMA_RXDESC_PROD_IDX_MASK;
+
+	cons = edma_r32(edma, EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring));
+	cons &= EDMA_RXDESC_CONS_IDX_MASK;
+
+	while (cons != prod && done < budget) {
+		rxdesc = EDMA_RXDESC_DESC(rxdesc_ring, cons);
+
+		rxph = phys_to_virt(rxdesc->buffer_addr);
+		page = virt_to_head_page(rxph);
+
+		pkt_len = rxdesc->status & EDMA_RXDESC_PACKET_LEN_MASK;
+
+		page_pool_dma_sync_for_cpu(edma->page_pool, page, 0,
+					   EDMA_RX_PREHDR_SIZE + pkt_len);
+
+		if (EDMA_RXPH_SRC_INFO_TYPE_GET(rxph) !=
+		    EDMA_PREHDR_DSTINFO_PORTID_IND) {
+			dev_warn(
+				&pdev->dev,
+				"rx drop: src_info_type=0x%x src_info=0x%04x dst_info=0x%04x\n",
+				EDMA_RXPH_SRC_INFO_TYPE_GET(rxph),
+				rxph->src_info, rxph->dst_info);
+			page_pool_put_full_page(edma->page_pool, page, true);
+			goto next;
+		}
+
+		src_port = rxph->src_info & EDMA_SRC_PORT_MASK;
+
+		skb = napi_build_skb(page_address(page), PAGE_SIZE);
+		if (unlikely(!skb)) {
+			page_pool_put_full_page(edma->page_pool, page, true);
+			goto next;
+		}
+
+		skb_mark_for_recycle(skb);
+		skb_reserve(skb, NET_SKB_PAD + EDMA_RX_PREHDR_SIZE);
+		skb_put(skb, pkt_len);
+
+		skb->protocol = eth_type_trans(skb, edma->netdev);
+
+		tag_info = skb_ext_add(skb, SKB_EXT_DSA_OOB);
+		if (unlikely(!tag_info)) {
+			dev_kfree_skb_any(skb);
+			goto next;
+		}
+		tag_info->port = src_port;
+
+		dev_sw_netstats_rx_add(edma->netdev, pkt_len);
+		napi_gro_receive(&edma->rx_napi, skb);
+
+next:
+		if (++cons == rxdesc_ring->count)
+			cons = 0;
+
+		done++;
+	}
+
+	edma_rx_fill(edma, &edma->rxfill_ring);
+
+	wmb();
+	edma_w32(edma, cons, EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring));
+	return done;
+}
+
+static int edma_tx_napi(struct napi_struct *napi, int budget)
+{
+	struct edma *edma = container_of(napi, struct edma, tx_napi);
+	int work = edma_clean_tx(edma, &edma->txcmpl_ring, budget);
+
+	if (edma->netdev && netif_queue_stopped(edma->netdev) &&
+	    netif_carrier_ok(edma->netdev)) {
+		u16 prod, cons, free;
+
+		prod = edma_r32(edma,
+				EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring)) &
+		       EDMA_TXDESC_PROD_IDX_MASK;
+		cons = edma_r32(edma,
+				EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring)) &
+		       EDMA_TXDESC_CONS_IDX_MASK;
+		free = (cons - prod - 1) & (edma->txdesc_ring.count - 1);
+
+		if (free > EDMA_TX_RING_THRESH)
+			netif_wake_queue(edma->netdev);
+	}
+
+	if (work < budget) {
+		if (edma_r32(edma, EDMA_REG_TX_INT_STAT(edma->soc->tx_int_base, edma->soc->txcmpl_ring)))
+			return budget;
+
+		if (napi_complete_done(napi, work))
+			edma_tx_irq_unmask(edma);
+	}
+
+	return work;
+}
+
+static int edma_rx_napi(struct napi_struct *napi, int budget)
+{
+	struct edma *edma = container_of(napi, struct edma, rx_napi);
+	int done;
+	u16 prod, cons;
+
+	done = edma_clean_rx(edma, budget, &edma->rxdesc_ring);
+
+	if (done < budget) {
+		if (edma_r32(edma,
+			     EDMA_REG_RXDESC_INT_STAT(edma->soc->rxdesc_ring)) ||
+		    edma_r32(edma,
+			     EDMA_REG_RXFILL_INT_STAT(edma->soc->rxfill_ring)))
+			return budget;
+
+		prod = edma_r32(edma,
+				EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring));
+		cons = edma_r32(edma,
+				EDMA_REG_RXFILL_CONS_IDX(edma->soc->rxfill_ring));
+		if ((prod & (edma->rxfill_ring.count - 1)) ==
+		    (cons & (edma->rxfill_ring.count - 1))) {
+			dev_warn_ratelimited(&edma->pdev->dev,
+					     "RXFILL ring starved\n");
+			edma_rx_fill(edma, &edma->rxfill_ring);
+			return budget;
+		}
+
+		if (napi_complete_done(napi, done))
+			edma_rx_irq_unmask(edma);
+	}
+
+	return done;
+}
+
+static netdev_tx_t edma_ring_xmit(struct edma *edma, struct net_device *netdev,
+				  struct sk_buff *skb,
+				  struct edma_ring *txdesc_ring)
+{
+	struct edma_tx_preheader *txph;
+	struct dsa_oob_tag_info *tag_info;
+	struct edma_txdesc *txdesc;
+	u16 prod, cons, next;
+	u16 buf_len, dst_info;
+	dma_addr_t dma;
+	u32 idx;
+
+	spin_lock_bh(&edma->tx_lock);
+
+	prod = edma_r32(edma, EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring));
+	prod &= EDMA_TXDESC_PROD_IDX_MASK;
+
+	cons = edma_r32(edma, EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring));
+	cons &= EDMA_TXDESC_CONS_IDX_MASK;
+
+	next = (prod + 1) & (txdesc_ring->count - 1);
+
+	if (next == cons) {
+		spin_unlock_bh(&edma->tx_lock);
+		return NETDEV_TX_BUSY;
+	}
+
+	buf_len = skb_headlen(skb);
+
+	tag_info = skb_ext_find(skb, SKB_EXT_DSA_OOB);
+	if (tag_info)
+		dst_info = (EDMA_DST_PORT_TYPE << 8) |
+			   (tag_info->port & EDMA_DST_PORT_ID_MASK);
+	else
+		dst_info = 0;
+
+	txph = (struct edma_tx_preheader *)skb_push(skb, EDMA_TX_PREHDR_SIZE);
+	memset((void *)txph, 0, EDMA_TX_PREHDR_SIZE);
+
+	txph->dst_info = dst_info;
+
+	idx = prod & (txdesc_ring->count - 1);
+	if (unlikely(txdesc_ring->skb_store[idx] != NULL)) {
+		spin_unlock_bh(&edma->tx_lock);
+		return NETDEV_TX_BUSY;
+	}
+
+	txdesc_ring->skb_store[idx] = skb;
+	txph->opaque = idx;
+
+	txdesc = EDMA_TXDESC_DESC(txdesc_ring, prod);
+
+	dma = dma_map_single(&edma->pdev->dev, skb->data,
+			     buf_len + EDMA_TX_PREHDR_SIZE, DMA_TO_DEVICE);
+	if (dma_mapping_error(&edma->pdev->dev, dma)) {
+		dev_kfree_skb_any(skb);
+		txdesc_ring->skb_store[idx] = NULL;
+		spin_unlock_bh(&edma->tx_lock);
+		return NETDEV_TX_OK;
+	}
+	txdesc->buffer_addr = cpu_to_le32(dma);
+
+	txdesc->word1 = (1 << EDMA_TXDESC_PREHEADER_SHIFT) |
+			((EDMA_TX_PREHDR_SIZE & EDMA_TXDESC_DATA_OFFSET_MASK)
+			 << EDMA_TXDESC_DATA_OFFSET_SHIFT) |
+			(buf_len & EDMA_TXDESC_DATA_LENGTH_MASK);
+
+	prod = (prod + 1) & (txdesc_ring->count - 1);
+
+	dev_sw_netstats_tx_add(netdev, 1, buf_len);
+	netdev_tx_sent_queue(netdev_get_tx_queue(netdev, 0), buf_len);
+
+	/* Ensure descriptor writes are visible before updating prod idx */
+	wmb();
+	edma_w32(edma, prod & EDMA_TXDESC_PROD_IDX_MASK,
+		 EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring));
+
+	if (((cons - prod - 1) & (txdesc_ring->count - 1)) <
+	    EDMA_TX_RING_THRESH)
+		netif_stop_queue(netdev);
+
+	spin_unlock_bh(&edma->tx_lock);
+	return NETDEV_TX_OK;
+}
+
+static void edma_rxfill_drain(struct edma *edma, struct edma_ring *rxfill_ring)
+{
+	struct edma_rxfill_desc *rxfill_desc;
+	u16 cons, prod;
+	dma_addr_t dma;
+	struct page *page;
+
+	prod = edma_r32(edma, EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring));
+	prod &= EDMA_RXFILL_PROD_IDX_MASK & (rxfill_ring->count - 1);
+
+	cons = edma_r32(edma, EDMA_REG_RXFILL_CONS_IDX(edma->soc->rxfill_ring));
+	cons &= EDMA_RXFILL_CONS_IDX_MASK & (rxfill_ring->count - 1);
+
+	while (prod != cons) {
+		rxfill_desc = EDMA_RXFILL_DESC(rxfill_ring, cons);
+		dma = le32_to_cpu(rxfill_desc->buffer_addr);
+		page = virt_to_head_page(phys_to_virt(dma));
+		page_pool_put_full_page(edma->page_pool, page, false);
+
+		if (++cons == rxfill_ring->count)
+			cons = 0;
+	}
+}
+
+static void edma_rxdesc_drain(struct edma *edma, struct edma_ring *rxdesc_ring)
+{
+	struct edma_rxdesc *rxdesc;
+	struct page *page;
+	u16 prod, cons;
+
+	cons = edma_r32(edma, EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring));
+	cons &= EDMA_RXDESC_CONS_IDX_MASK;
+
+	prod = edma_r32(edma, EDMA_REG_RXDESC_PROD_IDX(edma->soc->rxdesc_ring));
+	prod &= EDMA_RXDESC_PROD_IDX_MASK;
+
+	while (cons != prod) {
+		rxdesc = EDMA_RXDESC_DESC(rxdesc_ring, cons);
+		page = virt_to_head_page(phys_to_virt(rxdesc->buffer_addr));
+		page_pool_put_full_page(edma->page_pool, page, false);
+
+		if (++cons == rxdesc_ring->count)
+			cons = 0;
+	}
+
+	edma_w32(edma, cons, EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring));
+}
+
+static void edma_txdesc_drain(struct edma *edma, struct edma_ring *txdesc_ring)
+{
+	struct platform_device *pdev = edma->pdev;
+	struct edma_txdesc *txdesc;
+	struct sk_buff *skb;
+	u16 prod, cons;
+	size_t buf_len;
+
+	prod = edma_r32(edma, EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring));
+	prod &= EDMA_TXDESC_PROD_IDX_MASK;
+
+	cons = edma_r32(edma, EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring));
+	cons &= EDMA_TXDESC_CONS_IDX_MASK;
+
+	while (cons != prod) {
+		txdesc = EDMA_TXDESC_DESC(txdesc_ring, cons);
+
+		skb = txdesc_ring->skb_store[cons];
+		txdesc_ring->skb_store[cons] = NULL;
+
+		if (!skb)
+			goto next;
+
+		buf_len = txdesc->word1 & EDMA_TXDESC_DATA_LENGTH_MASK;
+
+		dma_unmap_single(&pdev->dev,
+				 le32_to_cpu(txdesc->buffer_addr),
+				 buf_len + EDMA_TX_PREHDR_SIZE, DMA_TO_DEVICE);
+
+		dev_kfree_skb_any(skb);
+next:
+		if (++cons == txdesc_ring->count)
+			cons = 0;
+	}
+}
+
+static int edma_rings_alloc(struct edma *edma)
+{
+	int ret;
+
+	ret = edma_tx_ring_alloc(edma, &edma->txdesc_ring, EDMA_TX_RING_SIZE,
+				 sizeof(struct edma_txdesc));
+	if (ret)
+		return ret;
+
+	ret = edma_ring_alloc(edma, &edma->txcmpl_ring, EDMA_TX_RING_SIZE,
+			      sizeof(struct edma_txcmpl));
+	if (ret)
+		goto err_txcmpl;
+
+	ret = edma_ring_alloc(edma, &edma->rxfill_ring, EDMA_RX_RING_SIZE,
+			      sizeof(struct edma_rxfill_desc));
+	if (ret)
+		goto err_rxfill;
+
+	ret = edma_ring_alloc(edma, &edma->rxdesc_ring, EDMA_RX_RING_SIZE,
+			      sizeof(struct edma_rxdesc));
+	if (ret)
+		goto err_rxdesc;
+
+	return 0;
+
+err_rxdesc:
+	edma_ring_free(edma, &edma->rxfill_ring,
+		       sizeof(struct edma_rxfill_desc));
+err_rxfill:
+	edma_ring_free(edma, &edma->txcmpl_ring, sizeof(struct edma_txcmpl));
+err_txcmpl:
+	edma_tx_ring_free(edma, &edma->txdesc_ring, sizeof(struct edma_txdesc));
+	return ret;
+}
+
+static void edma_rings_drain(struct edma *edma)
+{
+	edma_txdesc_drain(edma, &edma->txdesc_ring);
+	edma_clean_tx(edma, &edma->txcmpl_ring, INT_MAX);
+	edma_rxfill_drain(edma, &edma->rxfill_ring);
+	edma_rxdesc_drain(edma, &edma->rxdesc_ring);
+
+	edma_tx_ring_free(edma, &edma->txdesc_ring, sizeof(struct edma_txdesc));
+	edma_ring_free(edma, &edma->txcmpl_ring, sizeof(struct edma_txcmpl));
+	edma_ring_free(edma, &edma->rxfill_ring,
+		       sizeof(struct edma_rxfill_desc));
+	edma_ring_free(edma, &edma->rxdesc_ring, sizeof(struct edma_rxdesc));
+}
+
+static void edma_configure_txdesc_ring(struct edma *edma,
+				       struct edma_ring *txdesc_ring)
+{
+	u32 val;
+
+	edma_w32(edma, (u32)txdesc_ring->dma,
+		 EDMA_REG_TXDESC_BA(edma->soc->txdesc_ring));
+
+	edma_w32(edma, txdesc_ring->count & EDMA_TXDESC_RING_SIZE_MASK,
+		 EDMA_REG_TXDESC_RING_SIZE(edma->soc->txdesc_ring));
+
+	val = edma_r32(edma, EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring));
+	val &= ~EDMA_TXDESC_CONS_IDX_MASK;
+
+	edma_m32(edma, EDMA_TXDESC_PROD_IDX_MASK, val,
+		 EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring));
+}
+
+static void edma_configure_txcmpl_ring(struct edma *edma,
+				       struct edma_ring *txcmpl_ring)
+{
+	edma_w32(edma, (u32)txcmpl_ring->dma,
+		 EDMA_REG_TXCMPL_BA(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
+	edma_w32(edma, txcmpl_ring->count & EDMA_TXDESC_RING_SIZE_MASK,
+		 EDMA_REG_TXCMPL_RING_SIZE(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
+
+	edma_w32(edma, EDMA_TXCMPL_RETMODE_OPAQUE,
+		 EDMA_REG_TXCMPL_CTRL(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
+
+	edma_w32(edma, EDMA_TX_MOD_TIMER,
+		 EDMA_REG_TX_MOD_TIMER(edma->soc->tx_int_base, edma->soc->txcmpl_ring));
+
+	edma_w32(edma, 0x2, EDMA_REG_TX_INT_CTRL(edma->soc->tx_int_base, edma->soc->txcmpl_ring));
+}
+
+static void edma_configure_rxdesc_ring(struct edma *edma,
+				       struct edma_ring *rxdesc_ring)
+{
+	u32 val;
+
+	edma_w32(edma, (u32)rxdesc_ring->dma,
+		 EDMA_REG_RXDESC_BA(edma->soc->rxdesc_ring));
+
+	val = rxdesc_ring->count & EDMA_RXDESC_RING_SIZE_MASK;
+	val |= (EDMA_RX_PREHDR_SIZE & EDMA_RXDESC_PL_OFFSET_MASK)
+	       << EDMA_RXDESC_PL_OFFSET_SHIFT;
+	edma_w32(edma, val, EDMA_REG_RXDESC_RING_SIZE(edma->soc->rxdesc_ring));
+
+	edma_w32(edma, EDMA_RX_MOD_TIMER_INIT,
+		 EDMA_REG_RX_MOD_TIMER(edma->soc->rxdesc_ring));
+
+	edma_w32(edma, 0x2, EDMA_REG_RX_INT_CTRL(edma->soc->rxdesc_ring));
+}
+
+static void edma_configure_rxfill_ring(struct edma *edma,
+				       struct edma_ring *rxfill_ring)
+{
+	edma_w32(edma, (u32)rxfill_ring->dma,
+		 EDMA_REG_RXFILL_BA(edma->soc->rxfill_ring));
+
+	edma_w32(edma, rxfill_ring->count & EDMA_RXFILL_RING_SIZE_MASK,
+		 EDMA_REG_RXFILL_RING_SIZE(edma->soc->rxfill_ring));
+
+	edma_rx_fill(edma, rxfill_ring);
+}
+
+static void edma_configure_rings(struct edma *edma)
+{
+	edma_configure_txdesc_ring(edma, &edma->txdesc_ring);
+	edma_configure_txcmpl_ring(edma, &edma->txcmpl_ring);
+	edma_configure_rxfill_ring(edma, &edma->rxfill_ring);
+	edma_configure_rxdesc_ring(edma, &edma->rxdesc_ring);
+}
+
+static void edma_rings_disable(struct edma *edma)
+{
+	int i;
+
+	for (i = 0; i <= edma->soc->rxdesc_ring; i++)
+		edma_m32(edma, EDMA_RXDESC_RX_EN, 0, EDMA_REG_RXDESC_CTRL(i));
+
+	for (i = 0; i <= edma->soc->rxfill_ring; i++)
+		edma_m32(edma, EDMA_RXFILL_RING_EN, 0,
+			 EDMA_REG_RXFILL_RING_EN(i));
+
+	for (i = 0; i <= edma->soc->txdesc_ring; i++)
+		edma_m32(edma, EDMA_TXDESC_TX_EN, 0, EDMA_REG_TXDESC_CTRL(i));
+}
+
+static void edma_rings_enable(struct edma *edma)
+{
+	edma_m32(edma, 0, EDMA_RXDESC_RX_EN,
+		 EDMA_REG_RXDESC_CTRL(edma->soc->rxdesc_ring));
+
+	edma_m32(edma, 0, EDMA_RXFILL_RING_EN,
+		 EDMA_REG_RXFILL_RING_EN(edma->soc->rxfill_ring));
+
+	edma_m32(edma, 0, EDMA_TXDESC_TX_EN,
+		 EDMA_REG_TXDESC_CTRL(edma->soc->txdesc_ring));
+}
+
+static void edma_hw_stop(struct edma *edma)
+{
+	edma_irq_disable_all(edma);
+	edma_rings_disable(edma);
+	edma_w32(edma, 0, EDMA_REG_PORT_CTRL);
+}
+
+static void edma_hw_reset(struct edma *edma)
+{
+	reset_control_assert(edma->rst);
+	udelay(100);
+	reset_control_deassert(edma->rst);
+	udelay(100);
+}
+
+static int edma_hw_init(struct edma *edma)
+{
+	int ret;
+	u32 val;
+
+	edma_hw_reset(edma);
+	edma_hw_stop(edma);
+
+	edma_w32(edma, edma->soc->rxdesc_ring & 0xF, EDMA_QID2RID_TABLE_MEM(0));
+
+	ret = edma_rings_alloc(edma);
+	if (ret)
+		return ret;
+
+	edma_configure_rings(edma);
+
+	edma_w32(edma, 0, EDMA_REG_RXDESC2FILL_MAP_0);
+	edma_w32(edma,
+		 (edma->soc->rxfill_ring & 0x7)
+			 << ((edma->soc->rxdesc_ring % 10) * 3),
+		 EDMA_REG_RXDESC2FILL_MAP_1);
+
+	if (edma->soc->txcmpl_ring != edma->soc->txdesc_ring) {
+		int map_idx, bit_pos;
+		int i;
+
+		for (i = 0; i < 3; i++)
+			edma_w32(edma, 0, EDMA_REG_TXDESC2CMPL_MAP(i));
+
+		map_idx = edma->soc->txdesc_ring / 10;
+		bit_pos = (edma->soc->txdesc_ring % 10) * 3;
+		edma_m32(edma, 0,
+			 (edma->soc->txcmpl_ring & 0x7) << bit_pos,
+			 EDMA_REG_TXDESC2CMPL_MAP(map_idx));
+	}
+
+	val = EDMA_DMAR_BURST_LEN_SET(edma->soc->burst_enable) |
+	      EDMA_DMAR_REQ_PRI_SET(0) | EDMA_DMAR_TXDATA_NUM_SET(31) |
+	      EDMA_DMAR_TXDESC_NUM_SET(7) | EDMA_DMAR_RXFILL_NUM_SET(7);
+	edma_w32(edma, val, EDMA_REG_DMAR_CTRL);
+
+	if (edma->soc->axiw_enable)
+		edma_m32(edma, 0, EDMA_AXIW_MAX_WR_SIZE_EN, EDMA_REG_AXIW_CTRL);
+
+	edma_w32(edma, edma->soc->misc_int_mask, EDMA_REG_MISC_INT_MASK);
+
+	edma_w32(edma, EDMA_PORT_PAD_EN | EDMA_PORT_EDMA_EN,
+		 EDMA_REG_PORT_CTRL);
+
+	edma_rings_enable(edma);
+
+	return 0;
+}
+
+static void edma_get_drvinfo(struct net_device *netdev,
+			     struct ethtool_drvinfo *info)
+{
+	strscpy(info->driver, "qca-edma", sizeof(info->driver));
+	strscpy(info->bus_info, dev_name(netdev->dev.parent),
+		sizeof(info->bus_info));
+}
+
+static void edma_get_ringparam(struct net_device *netdev,
+			       struct ethtool_ringparam *ring,
+			       struct kernel_ethtool_ringparam *kernel_ring,
+			       struct netlink_ext_ack *extack)
+{
+	ring->tx_max_pending = EDMA_TX_RING_SIZE;
+	ring->rx_max_pending = EDMA_RX_RING_SIZE;
+	ring->tx_pending = EDMA_TX_RING_SIZE;
+	ring->rx_pending = EDMA_RX_RING_SIZE;
+}
+
+static const struct ethtool_ops edma_ethtool_ops = {
+	.get_drvinfo = edma_get_drvinfo,
+	.get_link = ethtool_op_get_link,
+	.get_ringparam = edma_get_ringparam,
+};
+
+static int edma_ndo_open(struct net_device *netdev)
+{
+	struct edma *edma = *(struct edma **)netdev_priv(netdev);
+
+	netdev_tx_reset_queue(netdev_get_tx_queue(netdev, 0));
+	napi_enable(&edma->tx_napi);
+	napi_enable(&edma->rx_napi);
+	netif_start_queue(netdev);
+	edma_tx_irq_unmask(edma);
+	edma_rx_irq_unmask(edma);
+
+	return 0;
+}
+
+static int edma_ndo_stop(struct net_device *netdev)
+{
+	struct edma *edma = *(struct edma **)netdev_priv(netdev);
+
+	edma_tx_irq_mask(edma);
+	edma_rx_irq_mask(edma);
+	netif_stop_queue(netdev);
+	napi_disable(&edma->tx_napi);
+	napi_disable(&edma->rx_napi);
+
+	return 0;
+}
+
+static netdev_tx_t edma_ndo_xmit(struct sk_buff *skb, struct net_device *netdev)
+{
+	struct edma *edma = *(struct edma **)netdev_priv(netdev);
+	netdev_tx_t ret;
+	u32 nhead, ntail;
+
+	if (skb->len < ETH_HLEN)
+		goto drop;
+
+	if (skb_is_nonlinear(skb) && skb_linearize(skb))
+		goto drop;
+
+	if (edma->soc->tx_min_size && skb->len < edma->soc->tx_min_size) {
+		if (skb_padto(skb, edma->soc->tx_min_size)) {
+			netdev->stats.tx_dropped++;
+			return NETDEV_TX_OK;
+		}
+		skb->len = edma->soc->tx_min_size;
+	}
+
+	nhead = netdev->needed_headroom;
+	ntail = netdev->needed_tailroom;
+
+	if ((skb_cloned(skb) || skb_headroom(skb) < nhead ||
+	     skb_tailroom(skb) < ntail) &&
+	    pskb_expand_head(skb, nhead, ntail, GFP_ATOMIC))
+		goto drop;
+
+	ret = edma_ring_xmit(edma, netdev, skb, &edma->txdesc_ring);
+	if (ret == NETDEV_TX_BUSY)
+		netif_stop_queue(netdev);
+
+	return ret;
+
+drop:
+	dev_kfree_skb_any(skb);
+	netdev->stats.tx_dropped++;
+
+	return NETDEV_TX_OK;
+}
+
+static const struct net_device_ops edma_netdev_ops = {
+	.ndo_open = edma_ndo_open,
+	.ndo_stop = edma_ndo_stop,
+	.ndo_start_xmit = edma_ndo_xmit,
+	.ndo_set_mac_address = eth_mac_addr,
+	.ndo_validate_addr = eth_validate_addr,
+	.ndo_get_stats64 = dev_get_tstats64,
+};
+
+static int edma_irq_init(struct edma *edma)
+{
+	struct platform_device *pdev = edma->pdev;
+	struct device *dev = &pdev->dev;
+	int ret;
+
+	edma->txcmpl_irq = platform_get_irq(pdev, 0);
+	if (edma->txcmpl_irq < 0)
+		return edma->txcmpl_irq;
+
+	edma->rxfill_irq = platform_get_irq(pdev, 1);
+	if (edma->rxfill_irq < 0)
+		return edma->rxfill_irq;
+
+	edma->rxdesc_irq = platform_get_irq(pdev, 2);
+	if (edma->rxdesc_irq < 0)
+		return edma->rxdesc_irq;
+
+	edma->misc_irq = platform_get_irq(pdev, 3);
+	if (edma->misc_irq < 0)
+		return edma->misc_irq;
+
+	ret = devm_request_irq(dev, edma->txcmpl_irq, edma_tx_irq_handle, 0,
+			       "edma_txcmpl", edma);
+	if (ret)
+		return ret;
+
+	ret = devm_request_irq(dev, edma->rxfill_irq, edma_rx_irq_handle, 0,
+			       "edma_rxfill", edma);
+	if (ret)
+		return ret;
+
+	ret = devm_request_irq(dev, edma->rxdesc_irq, edma_rx_irq_handle, 0,
+			       "edma_rxdesc", edma);
+	if (ret)
+		return ret;
+
+	ret = devm_request_irq(dev, edma->misc_irq, edma_misc_irq_handle, 0,
+			       "edma_misc", edma);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int edma_page_pool_create(struct edma *edma)
+{
+	struct page_pool_params pp = {
+		.pool_size = EDMA_RX_RING_SIZE,
+		.nid       = NUMA_NO_NODE,
+		.dev       = &edma->pdev->dev,
+		.dma_dir   = DMA_FROM_DEVICE,
+		.offset    = NET_SKB_PAD,
+		.max_len   = EDMA_RX_BUFFER_SIZE,
+		.flags     = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+	};
+
+	edma->page_pool = page_pool_create(&pp);
+	return PTR_ERR_OR_ZERO(edma->page_pool);
+}
+
+static int edma_probe(struct platform_device *pdev)
+{
+	struct clk_bulk_data *clks;
+	struct device *dev = &pdev->dev;
+	struct net_device *netdev;
+	struct edma **priv;
+	struct edma *edma;
+	int ret;
+
+	edma = devm_kzalloc(dev, sizeof(*edma), GFP_KERNEL);
+	if (!edma)
+		return -ENOMEM;
+
+	spin_lock_init(&edma->tx_lock);
+	edma->pdev = pdev;
+	edma->soc = device_get_match_data(dev);
+	platform_set_drvdata(pdev, edma);
+
+	ret = devm_clk_bulk_get_all_enabled(dev, &clks);
+	if (ret < 0)
+		return ret;
+
+	edma->reg_base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(edma->reg_base))
+		return PTR_ERR(edma->reg_base);
+
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return ret;
+
+	ret = edma_page_pool_create(edma);
+	if (ret)
+		return ret;
+
+	edma->rst = devm_reset_control_get(dev, EDMA_HW_RESET_ID);
+	if (IS_ERR(edma->rst)) {
+		ret = PTR_ERR(edma->rst);
+		goto err_page_pool;
+	}
+
+	ret = edma_hw_init(edma);
+	if (ret)
+		goto err_page_pool;
+
+	netdev = alloc_etherdev(sizeof(struct edma *));
+	if (!netdev) {
+		ret = -ENOMEM;
+		goto err_hw;
+	}
+
+	priv = netdev_priv(netdev);
+	*priv = edma;
+
+	SET_NETDEV_DEV(netdev, dev);
+	netdev->dev.of_node = dev->of_node;
+	eth_hw_addr_random(netdev);
+	netdev->netdev_ops = &edma_netdev_ops;
+	netdev->features = NETIF_F_GRO;
+	netdev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+	netdev->watchdog_timeo = 5 * HZ;
+	netdev->max_mtu = EDMA_RX_BUFFER_SIZE - ETH_HLEN - (2 * VLAN_HLEN);
+	netdev->needed_headroom = EDMA_TX_PREHDR_SIZE;
+	netdev->ethtool_ops = &edma_ethtool_ops;
+
+	edma->netdev = netdev;
+
+	netif_napi_add(netdev, &edma->tx_napi, edma_tx_napi);
+	netif_napi_add(netdev, &edma->rx_napi, edma_rx_napi);
+
+	ret = edma_irq_init(edma);
+	if (ret)
+		goto err_irq;
+
+	ret = register_netdev(netdev);
+	if (ret) {
+		dev_warn(dev, "failed to register conduit netdevice\n");
+		goto err_irq;
+	}
+
+	return 0;
+
+err_irq:
+	netif_napi_del(&edma->tx_napi);
+	netif_napi_del(&edma->rx_napi);
+	free_netdev(netdev);
+	edma->netdev = NULL;
+err_hw:
+	edma_hw_stop(edma);
+	edma_rings_drain(edma);
+err_page_pool:
+	page_pool_destroy(edma->page_pool);
+	return ret;
+}
+
+static void edma_remove(struct platform_device *pdev)
+{
+	struct edma *edma = platform_get_drvdata(pdev);
+
+	unregister_netdev(edma->netdev);
+	netif_napi_del(&edma->tx_napi);
+	netif_napi_del(&edma->rx_napi);
+	edma_hw_stop(edma);
+	edma_rings_drain(edma);
+	page_pool_destroy(edma->page_pool);
+	free_netdev(edma->netdev);
+}
+
+static const struct edma_soc_data ipq60xx_data = {
+	.txcmpl_base = 0x79000,
+	.tx_int_base = 0x91000,
+	.misc_int_mask = 0xff,
+	.txdesc_ring = 23,
+	.txcmpl_ring = 23,
+	.rxfill_ring = 7,
+	.rxdesc_ring = 15,
+	.burst_enable = true,
+	.axiw_enable = true,
+};
+
+static const struct edma_soc_data ipq807x_data = {
+	.txcmpl_base = 0x19000,
+	.tx_int_base = 0x21000,
+	.misc_int_mask = 0x1ff,
+	.txdesc_ring = 23,
+	.txcmpl_ring = 7,
+	.rxfill_ring = 7,
+	.rxdesc_ring = 15,
+	.tx_min_size = 33,
+};
+
+static const struct of_device_id edma_of_match[] = {
+	{ .compatible = "qualcomm,ipq6018-edma", .data = &ipq60xx_data },
+	{ .compatible = "qualcomm,ipq8074-edma", .data = &ipq807x_data },
+	{},
+};
+
+static struct platform_driver edma_driver = {
+	.driver = {
+		.name = "qca-edma",
+		.of_match_table = edma_of_match,
+	},
+	.probe = edma_probe,
+	.remove = edma_remove,
+};
+
+module_platform_driver(edma_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Qualcomm IPQ EDMA Ethernet driver");
