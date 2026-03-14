@@ -233,7 +233,7 @@ struct edma_ring {
 	struct sk_buff **skb_store;
 };
 
-struct edma {
+struct edma_priv {
 	const struct edma_soc_data *soc;
 	struct napi_struct tx_napi;
 	struct napi_struct rx_napi;
