@@ -239,7 +239,7 @@ struct edma {
 	struct napi_struct rx_napi;
 	struct net_device *netdev;
 	struct platform_device *pdev;
-	void __iomem *reg_base;
+	struct regmap *regmap;
 	struct reset_control *rst;
 	struct page_pool *page_pool;
 

@@ -13,77 +13,73 @@
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/property.h>
+#include <linux/regmap.h>
 #include <linux/reset.h>
 #include "qca_edma.h"
-
-
-static inline u32 edma_r32(struct edma *edma, u32 reg)
-{
-	return readl(edma->reg_base + reg);
-}
-
-static inline void edma_w32(struct edma *edma, u32 val, u32 reg)
-{
-	writel(val, edma->reg_base + reg);
-}
-
-static inline void edma_m32(struct edma *edma, u32 mask, u32 set, u32 reg)
-{
-	u32 val;
-
-	val = edma_r32(edma, reg);
-	val &= ~mask;
-	val |= set;
-	edma_w32(edma, val, reg);
-}
 
 static void edma_irq_disable_all(struct edma *edma)
 {
 	int i;
 
 	for (i = 0; i <= edma->soc->txdesc_ring; i++)
-		edma_w32(edma, 0, EDMA_REG_TX_INT_MASK(edma->soc->tx_int_base, i));
+		regmap_write(edma->regmap,
+			     EDMA_REG_TX_INT_MASK(edma->soc->tx_int_base, i),
+			     0);
 
 	for (i = 0; i <= edma->soc->rxfill_ring; i++)
-		edma_w32(edma, 0, EDMA_REG_RXFILL_INT_MASK(i));
+		regmap_write(edma->regmap, EDMA_REG_RXFILL_INT_MASK(i), 0);
 
 	for (i = 0; i <= edma->soc->rxdesc_ring; i++) {
-		edma_w32(edma, 0, EDMA_REG_RXDESC_INT_MASK(i));
-		edma_w32(edma, 0, EDMA_REG_RX_INT_CTRL(i));
+		regmap_write(edma->regmap, EDMA_REG_RXDESC_INT_MASK(i), 0);
+		regmap_write(edma->regmap, EDMA_REG_RX_INT_CTRL(i), 0);
 	}
 }
 
 static void edma_tx_irq_mask(struct edma *edma)
 {
-	edma_w32(edma, 0,
-		 EDMA_REG_TX_INT_MASK(edma->soc->tx_int_base, edma->soc->txcmpl_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_TX_INT_MASK(edma->soc->tx_int_base,
+					  edma->soc->txcmpl_ring),
+		     0);
 }
 
 static void edma_tx_irq_unmask(struct edma *edma)
 {
-	edma_w32(edma, EDMA_TX_INT_MASK,
-		 EDMA_REG_TX_INT_MASK(edma->soc->tx_int_base, edma->soc->txcmpl_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_TX_INT_MASK(edma->soc->tx_int_base,
+					  edma->soc->txcmpl_ring),
+		     EDMA_TX_INT_MASK);
 }
 
 static void edma_rx_irq_mask(struct edma *edma)
 {
-	edma_w32(edma, 0, EDMA_REG_RXFILL_INT_MASK(edma->soc->rxfill_ring));
-	edma_w32(edma, 0, EDMA_REG_RXDESC_INT_MASK(edma->soc->rxdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXFILL_INT_MASK(edma->soc->rxfill_ring),
+		     0);
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXDESC_INT_MASK(edma->soc->rxdesc_ring),
+		     0);
 }
 
 static void edma_rx_irq_unmask(struct edma *edma)
 {
-	edma_w32(edma, EDMA_RXFILL_INT_MASK,
-		 EDMA_REG_RXFILL_INT_MASK(edma->soc->rxfill_ring));
-	edma_w32(edma, EDMA_RXDESC_INT_MASK_PKT_INT,
-		 EDMA_REG_RXDESC_INT_MASK(edma->soc->rxdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXFILL_INT_MASK(edma->soc->rxfill_ring),
+		     EDMA_RXFILL_INT_MASK);
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXDESC_INT_MASK(edma->soc->rxdesc_ring),
+		     EDMA_RXDESC_INT_MASK_PKT_INT);
 }
 
 static irqreturn_t edma_tx_irq_handle(int irq, void *ctx)
 {
 	struct edma *edma = ctx;
+	u32 val;
 
-	if (!edma_r32(edma, EDMA_REG_TX_INT_STAT(edma->soc->tx_int_base, edma->soc->txcmpl_ring)))
+	regmap_read(edma->regmap,
+		    EDMA_REG_TX_INT_STAT(edma->soc->tx_int_base,
+					 edma->soc->txcmpl_ring), &val);
+	if (!val)
 		return IRQ_NONE;
 
 	edma_tx_irq_mask(edma);
@@ -97,10 +93,16 @@ static irqreturn_t edma_tx_irq_handle(int irq, void *ctx)
 static irqreturn_t edma_rx_irq_handle(int irq, void *ctx)
 {
 	struct edma *edma = ctx;
-	u32 status = 0;
+	u32 val, status = 0;
 
-	status |= edma_r32(edma, EDMA_REG_RXDESC_INT_STAT(edma->soc->rxdesc_ring));
-	status |= edma_r32(edma, EDMA_REG_RXFILL_INT_STAT(edma->soc->rxfill_ring));
+	regmap_read(edma->regmap,
+		    EDMA_REG_RXDESC_INT_STAT(edma->soc->rxdesc_ring),
+		    &val);
+	status |= val;
+	regmap_read(edma->regmap,
+		    EDMA_REG_RXFILL_INT_STAT(edma->soc->rxfill_ring),
+		    &val);
+	status |= val;
 
 	if (!status)
 		return IRQ_NONE;
@@ -116,8 +118,10 @@ static irqreturn_t edma_rx_irq_handle(int irq, void *ctx)
 static irqreturn_t edma_misc_irq_handle(int irq, void *ctx)
 {
 	struct edma *edma = ctx;
+	u32 val;
 
-	if (!edma_r32(edma, EDMA_REG_MISC_INT_STAT))
+	regmap_read(edma->regmap, EDMA_REG_MISC_INT_STAT, &val);
+	if (!val)
 		return IRQ_NONE;
 
 	return IRQ_HANDLED;
@@ -189,12 +193,15 @@ static int edma_rx_fill(struct edma *edma, struct edma_ring *rxfill_ring)
 	struct page *page;
 	u16 filled = 0;
 	dma_addr_t dma;
+	u32 val;
 
-	prod = edma_r32(edma, EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring));
-	prod &= EDMA_RXFILL_PROD_IDX_MASK & (rxfill_ring->count - 1);
+	regmap_read(edma->regmap, EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring),
+		    &val);
+	prod = val & EDMA_RXFILL_PROD_IDX_MASK & (rxfill_ring->count - 1);
 
-	cons = edma_r32(edma, EDMA_REG_RXFILL_CONS_IDX(edma->soc->rxfill_ring));
-	cons &= EDMA_RXFILL_CONS_IDX_MASK & (rxfill_ring->count - 1);
+	regmap_read(edma->regmap, EDMA_REG_RXFILL_CONS_IDX(edma->soc->rxfill_ring),
+		    &val);
+	cons = val & EDMA_RXFILL_CONS_IDX_MASK & (rxfill_ring->count - 1);
 
 	while (1) {
 		next = prod + 1;
@@ -221,8 +228,9 @@ static int edma_rx_fill(struct edma *edma, struct edma_ring *rxfill_ring)
 
 	if (filled) {
 		wmb();
-		edma_w32(edma, prod & EDMA_RXFILL_PROD_IDX_MASK,
-			 EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring));
+		regmap_write(edma->regmap,
+			     EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring),
+			     prod & EDMA_RXFILL_PROD_IDX_MASK);
 	}
 
 	return filled;
@@ -237,14 +245,20 @@ static u32 edma_clean_tx(struct edma *edma, struct edma_ring *txcmpl_ring,
 	u32 cleaned = 0, bytes = 0;
 	u16 prod, cons;
 	struct sk_buff *skb;
+	u32 val, len;
 	int idx;
-	u32 len;
 
-	prod = edma_r32(edma, EDMA_REG_TXCMPL_PROD_IDX(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
-	prod &= EDMA_TXCMPL_PROD_IDX_MASK;
+	regmap_read(edma->regmap,
+		    EDMA_REG_TXCMPL_PROD_IDX(edma->soc->txcmpl_base,
+					     edma->soc->txcmpl_ring),
+		    &val);
+	prod = val & EDMA_TXCMPL_PROD_IDX_MASK;
 
-	cons = edma_r32(edma, EDMA_REG_TXCMPL_CONS_IDX(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
-	cons &= EDMA_TXCMPL_CONS_IDX_MASK;
+	regmap_read(edma->regmap,
+		    EDMA_REG_TXCMPL_CONS_IDX(edma->soc->txcmpl_base,
+					     edma->soc->txcmpl_ring),
+		    &val);
+	cons = val & EDMA_TXCMPL_CONS_IDX_MASK;
 
 	while (cons != prod && cleaned < budget) {
 		txcmpl = EDMA_TXCMPL_DESC(txcmpl_ring, cons);
@@ -284,7 +298,10 @@ next:
 
 	/* Ensure all TX completions are processed before updating cons idx */
 	wmb();
-	edma_w32(edma, cons, EDMA_REG_TXCMPL_CONS_IDX(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
+	regmap_write(edma->priv,
+		     EDMA_REG_TXCMPL_CONS_IDX(edma->soc->txcmpl_base,
+					      edma->soc->txcmpl_ring),
+		     cons);
 
 	return cleaned;
 }
@@ -302,12 +319,15 @@ static u32 edma_clean_rx(struct edma *edma, int budget,
 	u32 done = 0;
 	u32 src_port;
 	int pkt_len;
+	u32 val;
 
-	prod = edma_r32(edma, EDMA_REG_RXDESC_PROD_IDX(edma->soc->rxdesc_ring));
-	prod &= EDMA_RXDESC_PROD_IDX_MASK;
+	regmap_read(edma->regmap, EDMA_REG_RXDESC_PROD_IDX(edma->soc->rxdesc_ring),
+		    &val);
+	prod = val & EDMA_RXDESC_PROD_IDX_MASK;
 
-	cons = edma_r32(edma, EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring));
-	cons &= EDMA_RXDESC_CONS_IDX_MASK;
+	regmap_read(edma->regmap, EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring),
+		    &val);
+	cons = val & EDMA_RXDESC_CONS_IDX_MASK;
 
 	while (cons != prod && done < budget) {
 		rxdesc = EDMA_RXDESC_DESC(rxdesc_ring, cons);
@@ -365,7 +385,9 @@ next:
 	edma_rx_fill(edma, &edma->rxfill_ring);
 
 	wmb();
-	edma_w32(edma, cons, EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring),
+		     cons);
 	return done;
 }
 
@@ -373,17 +395,18 @@ static int edma_tx_napi(struct napi_struct *napi, int budget)
 {
 	struct edma *edma = container_of(napi, struct edma, tx_napi);
 	int work = edma_clean_tx(edma, &edma->txcmpl_ring, budget);
+	u32 val;
 
 	if (edma->netdev && netif_queue_stopped(edma->netdev) &&
 	    netif_carrier_ok(edma->netdev)) {
 		u16 prod, cons, free;
 
-		prod = edma_r32(edma,
-				EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring)) &
-		       EDMA_TXDESC_PROD_IDX_MASK;
-		cons = edma_r32(edma,
-				EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring)) &
-		       EDMA_TXDESC_CONS_IDX_MASK;
+		regmap_read(edma->regmap,
+			    EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring), &val);
+		prod = val & EDMA_TXDESC_PROD_IDX_MASK;
+		regmap_read(edma->regmap,
+			    EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring), &val);
+		cons = val & EDMA_TXDESC_CONS_IDX_MASK;
 		free = (cons - prod - 1) & (edma->txdesc_ring.count - 1);
 
 		if (free > EDMA_TX_RING_THRESH)
@@ -391,7 +414,11 @@ static int edma_tx_napi(struct napi_struct *napi, int budget)
 	}
 
 	if (work < budget) {
-		if (edma_r32(edma, EDMA_REG_TX_INT_STAT(edma->soc->tx_int_base, edma->soc->txcmpl_ring)))
+		regmap_read(edma->regmap,
+			    EDMA_REG_TX_INT_STAT(edma->soc->tx_int_base,
+						 edma->soc->txcmpl_ring),
+			    &val);
+		if (val)
 			return budget;
 
 		if (napi_complete_done(napi, work))
@@ -410,18 +437,28 @@ static int edma_rx_napi(struct napi_struct *napi, int budget)
 	done = edma_clean_rx(edma, budget, &edma->rxdesc_ring);
 
 	if (done < budget) {
-		if (edma_r32(edma,
-			     EDMA_REG_RXDESC_INT_STAT(edma->soc->rxdesc_ring)) ||
-		    edma_r32(edma,
-			     EDMA_REG_RXFILL_INT_STAT(edma->soc->rxfill_ring)))
+		u32 val;
+
+		regmap_read(edma->regmap,
+			    EDMA_REG_RXDESC_INT_STAT(edma->soc->rxdesc_ring),
+			    &val);
+		prod = val;
+		regmap_read(edma->regmap,
+			    EDMA_REG_RXFILL_INT_STAT(edma->soc->rxfill_ring),
+			    &val);
+		cons = val;
+		if (prod || cons)
 			return budget;
 
-		prod = edma_r32(edma,
-				EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring));
-		cons = edma_r32(edma,
-				EDMA_REG_RXFILL_CONS_IDX(edma->soc->rxfill_ring));
-		if ((prod & (edma->rxfill_ring.count - 1)) ==
-		    (cons & (edma->rxfill_ring.count - 1))) {
+		regmap_read(edma->regmap,
+			    EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring),
+			    &val);
+		prod = val & (edma->rxfill_ring.count - 1);
+		regmap_read(edma->regmap,
+			    EDMA_REG_RXFILL_CONS_IDX(edma->soc->rxfill_ring),
+			    &val);
+		cons = val & (edma->rxfill_ring.count - 1);
+		if (prod == cons) {
 			dev_warn_ratelimited(&edma->pdev->dev,
 					     "RXFILL ring starved\n");
 			edma_rx_fill(edma, &edma->rxfill_ring);
@@ -445,15 +482,19 @@ static netdev_tx_t edma_ring_xmit(struct edma *edma, struct net_device *netdev,
 	u16 prod, cons, next;
 	u16 buf_len, dst_info;
 	dma_addr_t dma;
-	u32 idx;
+	u32 val, idx;
 
 	spin_lock_bh(&edma->tx_lock);
 
-	prod = edma_r32(edma, EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring));
-	prod &= EDMA_TXDESC_PROD_IDX_MASK;
+	regmap_read(edma->regmap,
+		    EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring),
+		    &val);
+	prod = val & EDMA_TXDESC_PROD_IDX_MASK;
 
-	cons = edma_r32(edma, EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring));
-	cons &= EDMA_TXDESC_CONS_IDX_MASK;
+	regmap_read(edma->regmap,
+		    EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring),
+		    &val);
+	cons = val & EDMA_TXDESC_CONS_IDX_MASK;
 
 	next = (prod + 1) & (txdesc_ring->count - 1);
 
@@ -509,8 +550,9 @@ static netdev_tx_t edma_ring_xmit(struct edma *edma, struct net_device *netdev,
 
 	/* Ensure descriptor writes are visible before updating prod idx */
 	wmb();
-	edma_w32(edma, prod & EDMA_TXDESC_PROD_IDX_MASK,
-		 EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring),
+		     prod & EDMA_TXDESC_PROD_IDX_MASK);
 
 	if (((cons - prod - 1) & (txdesc_ring->count - 1)) <
 	    EDMA_TX_RING_THRESH)
@@ -526,12 +568,17 @@ static void edma_rxfill_drain(struct edma *edma, struct edma_ring *rxfill_ring)
 	u16 cons, prod;
 	dma_addr_t dma;
 	struct page *page;
+	u32 val;
 
-	prod = edma_r32(edma, EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring));
-	prod &= EDMA_RXFILL_PROD_IDX_MASK & (rxfill_ring->count - 1);
+	regmap_read(edma->regmap,
+		    EDMA_REG_RXFILL_PROD_IDX(edma->soc->rxfill_ring),
+		    &val);
+	prod = val & EDMA_RXFILL_PROD_IDX_MASK & (rxfill_ring->count - 1);
 
-	cons = edma_r32(edma, EDMA_REG_RXFILL_CONS_IDX(edma->soc->rxfill_ring));
-	cons &= EDMA_RXFILL_CONS_IDX_MASK & (rxfill_ring->count - 1);
+	regmap_read(edma->regmap,
+		    EDMA_REG_RXFILL_CONS_IDX(edma->soc->rxfill_ring),
+		    &val);
+	cons = val & EDMA_RXFILL_CONS_IDX_MASK & (rxfill_ring->count - 1);
 
 	while (prod != cons) {
 		rxfill_desc = EDMA_RXFILL_DESC(rxfill_ring, cons);
@@ -549,12 +596,17 @@ static void edma_rxdesc_drain(struct edma *edma, struct edma_ring *rxdesc_ring)
 	struct edma_rxdesc *rxdesc;
 	struct page *page;
 	u16 prod, cons;
+	u32 val;
 
-	cons = edma_r32(edma, EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring));
-	cons &= EDMA_RXDESC_CONS_IDX_MASK;
+	regmap_read(edma->regmap,
+		    EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring),
+		    &val);
+	cons = val & EDMA_RXDESC_CONS_IDX_MASK;
 
-	prod = edma_r32(edma, EDMA_REG_RXDESC_PROD_IDX(edma->soc->rxdesc_ring));
-	prod &= EDMA_RXDESC_PROD_IDX_MASK;
+	regmap_read(edma->regmap,
+		    EDMA_REG_RXDESC_PROD_IDX(edma->soc->rxdesc_ring),
+		    &val);
+	prod = val & EDMA_RXDESC_PROD_IDX_MASK;
 
 	while (cons != prod) {
 		rxdesc = EDMA_RXDESC_DESC(rxdesc_ring, cons);
@@ -565,7 +617,9 @@ static void edma_rxdesc_drain(struct edma *edma, struct edma_ring *rxdesc_ring)
 			cons = 0;
 	}
 
-	edma_w32(edma, cons, EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXDESC_CONS_IDX(edma->soc->rxdesc_ring),
+		     cons);
 }
 
 static void edma_txdesc_drain(struct edma *edma, struct edma_ring *txdesc_ring)
@@ -575,12 +629,17 @@ static void edma_txdesc_drain(struct edma *edma, struct edma_ring *txdesc_ring)
 	struct sk_buff *skb;
 	u16 prod, cons;
 	size_t buf_len;
+	u32 val;
 
-	prod = edma_r32(edma, EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring));
-	prod &= EDMA_TXDESC_PROD_IDX_MASK;
+	regmap_read(edma->regmap,
+		    EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring),
+		    &val);
+	prod = val & EDMA_TXDESC_PROD_IDX_MASK;
 
-	cons = edma_r32(edma, EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring));
-	cons &= EDMA_TXDESC_CONS_IDX_MASK;
+	regmap_read(edma->regmap,
+		    EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring),
+		    &val);
+	cons = val & EDMA_TXDESC_CONS_IDX_MASK;
 
 	while (cons != prod) {
 		txdesc = EDMA_TXDESC_DESC(txdesc_ring, cons);
@@ -659,34 +718,47 @@ static void edma_configure_txdesc_ring(struct edma *edma,
 {
 	u32 val;
 
-	edma_w32(edma, (u32)txdesc_ring->dma,
-		 EDMA_REG_TXDESC_BA(edma->soc->txdesc_ring));
+	regmap_write(edma->regmap, EDMA_REG_TXDESC_BA(edma->soc->txdesc_ring),
+		    (u32)txdesc_ring->dma);
 
-	edma_w32(edma, txdesc_ring->count & EDMA_TXDESC_RING_SIZE_MASK,
-		 EDMA_REG_TXDESC_RING_SIZE(edma->soc->txdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_TXDESC_RING_SIZE(edma->soc->txdesc_ring),
+		     txdesc_ring->count & EDMA_TXDESC_RING_SIZE_MASK);
 
-	val = edma_r32(edma, EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring));
+	regmap_read(edma->regmap, EDMA_REG_TXDESC_CONS_IDX(edma->soc->txdesc_ring),
+		    &val);
 	val &= ~EDMA_TXDESC_CONS_IDX_MASK;
 
-	edma_m32(edma, EDMA_TXDESC_PROD_IDX_MASK, val,
-		 EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring));
+	regmap_update_bits(edma->regmap,
+			   EDMA_REG_TXDESC_PROD_IDX(edma->soc->txdesc_ring),
+			   EDMA_TXDESC_PROD_IDX_MASK, val);
 }
 
 static void edma_configure_txcmpl_ring(struct edma *edma,
 				       struct edma_ring *txcmpl_ring)
 {
-	edma_w32(edma, (u32)txcmpl_ring->dma,
-		 EDMA_REG_TXCMPL_BA(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
-	edma_w32(edma, txcmpl_ring->count & EDMA_TXDESC_RING_SIZE_MASK,
-		 EDMA_REG_TXCMPL_RING_SIZE(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_TXCMPL_BA(edma->soc->txcmpl_base, edma->soc->txcmpl_ring),
+		     (u32)txcmpl_ring->dma);
+	regmap_write(edma->regmap,
+		     EDMA_REG_TXCMPL_RING_SIZE(edma->soc->txcmpl_base,
+					       edma->soc->txcmpl_ring),
+		     txcmpl_ring->count & EDMA_TXDESC_RING_SIZE_MASK);
 
-	edma_w32(edma, EDMA_TXCMPL_RETMODE_OPAQUE,
-		 EDMA_REG_TXCMPL_CTRL(edma->soc->txcmpl_base, edma->soc->txcmpl_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_TXCMPL_CTRL(edma->soc->txcmpl_base,
+					  edma->soc->txcmpl_ring),
+		     EDMA_TXCMPL_RETMODE_OPAQUE);
 
-	edma_w32(edma, EDMA_TX_MOD_TIMER,
-		 EDMA_REG_TX_MOD_TIMER(edma->soc->tx_int_base, edma->soc->txcmpl_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_TX_MOD_TIMER(edma->soc->tx_int_base,
+					   edma->soc->txcmpl_ring),
+		     EDMA_TX_MOD_TIMER);
 
-	edma_w32(edma, 0x2, EDMA_REG_TX_INT_CTRL(edma->soc->tx_int_base, edma->soc->txcmpl_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_TX_INT_CTRL(edma->soc->tx_int_base,
+					  edma->soc->txcmpl_ring),
+		     0x2);
 }
 
 static void edma_configure_rxdesc_ring(struct edma *edma,
@@ -694,28 +766,36 @@ static void edma_configure_rxdesc_ring(struct edma *edma,
 {
 	u32 val;
 
-	edma_w32(edma, (u32)rxdesc_ring->dma,
-		 EDMA_REG_RXDESC_BA(edma->soc->rxdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXDESC_BA(edma->soc->rxdesc_ring),
+		     (u32)rxdesc_ring->dma);
 
 	val = rxdesc_ring->count & EDMA_RXDESC_RING_SIZE_MASK;
 	val |= (EDMA_RX_PREHDR_SIZE & EDMA_RXDESC_PL_OFFSET_MASK)
 	       << EDMA_RXDESC_PL_OFFSET_SHIFT;
-	edma_w32(edma, val, EDMA_REG_RXDESC_RING_SIZE(edma->soc->rxdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXDESC_RING_SIZE(edma->soc->rxdesc_ring),
+		     val);
 
-	edma_w32(edma, EDMA_RX_MOD_TIMER_INIT,
-		 EDMA_REG_RX_MOD_TIMER(edma->soc->rxdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RX_MOD_TIMER(edma->soc->rxdesc_ring),
+		     EDMA_RX_MOD_TIMER_INIT);
 
-	edma_w32(edma, 0x2, EDMA_REG_RX_INT_CTRL(edma->soc->rxdesc_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RX_INT_CTRL(edma->soc->rxdesc_ring),
+		     0x2);
 }
 
 static void edma_configure_rxfill_ring(struct edma *edma,
 				       struct edma_ring *rxfill_ring)
 {
-	edma_w32(edma, (u32)rxfill_ring->dma,
-		 EDMA_REG_RXFILL_BA(edma->soc->rxfill_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXFILL_BA(edma->soc->rxfill_ring),
+		     (u32)rxfill_ring->dma);
 
-	edma_w32(edma, rxfill_ring->count & EDMA_RXFILL_RING_SIZE_MASK,
-		 EDMA_REG_RXFILL_RING_SIZE(edma->soc->rxfill_ring));
+	regmap_write(edma->regmap,
+		     EDMA_REG_RXFILL_RING_SIZE(edma->soc->rxfill_ring),
+		     rxfill_ring->count & EDMA_RXFILL_RING_SIZE_MASK);
 
 	edma_rx_fill(edma, rxfill_ring);
 }
@@ -733,33 +813,38 @@ static void edma_rings_disable(struct edma *edma)
 	int i;
 
 	for (i = 0; i <= edma->soc->rxdesc_ring; i++)
-		edma_m32(edma, EDMA_RXDESC_RX_EN, 0, EDMA_REG_RXDESC_CTRL(i));
+		regmap_clear_bits(edma->regmap, EDMA_REG_RXDESC_CTRL(i),
+				  EDMA_RXDESC_RX_EN);
 
 	for (i = 0; i <= edma->soc->rxfill_ring; i++)
-		edma_m32(edma, EDMA_RXFILL_RING_EN, 0,
-			 EDMA_REG_RXFILL_RING_EN(i));
+		regmap_clear_bits(edma->regmap, EDMA_REG_RXFILL_RING_EN(i),
+				  EDMA_RXFILL_RING_EN);
 
 	for (i = 0; i <= edma->soc->txdesc_ring; i++)
-		edma_m32(edma, EDMA_TXDESC_TX_EN, 0, EDMA_REG_TXDESC_CTRL(i));
+		regmap_clear_bits(edma->regmap, EDMA_REG_TXDESC_CTRL(i),
+				  EDMA_TXDESC_TX_EN);
 }
 
 static void edma_rings_enable(struct edma *edma)
 {
-	edma_m32(edma, 0, EDMA_RXDESC_RX_EN,
-		 EDMA_REG_RXDESC_CTRL(edma->soc->rxdesc_ring));
+	regmap_set_bits(edma->regmap,
+			EDMA_REG_RXDESC_CTRL(edma->soc->rxdesc_ring),
+			EDMA_RXDESC_RX_EN);
 
-	edma_m32(edma, 0, EDMA_RXFILL_RING_EN,
-		 EDMA_REG_RXFILL_RING_EN(edma->soc->rxfill_ring));
+	regmap_set_bits(edma->regmap,
+			EDMA_REG_RXFILL_RING_EN(edma->soc->rxfill_ring),
+			EDMA_RXFILL_RING_EN);
 
-	edma_m32(edma, 0, EDMA_TXDESC_TX_EN,
-		 EDMA_REG_TXDESC_CTRL(edma->soc->txdesc_ring));
+	regmap_set_bits(edma->regmap,
+			EDMA_REG_TXDESC_CTRL(edma->soc->txdesc_ring),
+			EDMA_TXDESC_TX_EN);
 }
 
 static void edma_hw_stop(struct edma *edma)
 {
 	edma_irq_disable_all(edma);
 	edma_rings_disable(edma);
-	edma_w32(edma, 0, EDMA_REG_PORT_CTRL);
+	regmap_write(edma->regmap, EDMA_REG_PORT_CTRL, 0);
 }
 
 static void edma_hw_reset(struct edma *edma)
@@ -778,7 +863,8 @@ static int edma_hw_init(struct edma *edma)
 	edma_hw_reset(edma);
 	edma_hw_stop(edma);
 
-	edma_w32(edma, edma->soc->rxdesc_ring & 0xF, EDMA_QID2RID_TABLE_MEM(0));
+	regmap_write(edma->regmap, EDMA_QID2RID_TABLE_MEM(0),
+		     edma->soc->rxdesc_ring & 0xF);
 
 	ret = edma_rings_alloc(edma);
 	if (ret)
@@ -786,38 +872,37 @@ static int edma_hw_init(struct edma *edma)
 
 	edma_configure_rings(edma);
 
-	edma_w32(edma, 0, EDMA_REG_RXDESC2FILL_MAP_0);
-	edma_w32(edma,
+	regmap_write(edma->regmap, EDMA_REG_RXDESC2FILL_MAP_0, 0);
+	regmap_write(edma->regmap, EDMA_REG_RXDESC2FILL_MAP_1,
 		 (edma->soc->rxfill_ring & 0x7)
-			 << ((edma->soc->rxdesc_ring % 10) * 3),
-		 EDMA_REG_RXDESC2FILL_MAP_1);
+			 << ((edma->soc->rxdesc_ring % 10) * 3));
 
 	if (edma->soc->txcmpl_ring != edma->soc->txdesc_ring) {
 		int map_idx, bit_pos;
 		int i;
 
 		for (i = 0; i < 3; i++)
-			edma_w32(edma, 0, EDMA_REG_TXDESC2CMPL_MAP(i));
+			regmap_write(edma->regmap, EDMA_REG_TXDESC2CMPL_MAP(i), 0);
 
 		map_idx = edma->soc->txdesc_ring / 10;
 		bit_pos = (edma->soc->txdesc_ring % 10) * 3;
-		edma_m32(edma, 0,
-			 (edma->soc->txcmpl_ring & 0x7) << bit_pos,
-			 EDMA_REG_TXDESC2CMPL_MAP(map_idx));
+		regmap_set_bits(edma->regmap, EDMA_REG_TXDESC2CMPL_MAP(map_idx),
+				(edma->soc->txcmpl_ring & 0x7) << bit_pos);
 	}
 
 	val = EDMA_DMAR_BURST_LEN_SET(edma->soc->burst_enable) |
 	      EDMA_DMAR_REQ_PRI_SET(0) | EDMA_DMAR_TXDATA_NUM_SET(31) |
 	      EDMA_DMAR_TXDESC_NUM_SET(7) | EDMA_DMAR_RXFILL_NUM_SET(7);
-	edma_w32(edma, val, EDMA_REG_DMAR_CTRL);
+	regmap_write(edma->regmap, EDMA_REG_DMAR_CTRL, val);
 
 	if (edma->soc->axiw_enable)
-		edma_m32(edma, 0, EDMA_AXIW_MAX_WR_SIZE_EN, EDMA_REG_AXIW_CTRL);
+		regmap_set_bits(edma->regmap, EDMA_REG_AXIW_CTRL,
+				EDMA_AXIW_MAX_WR_SIZE_EN);
 
-	edma_w32(edma, edma->soc->misc_int_mask, EDMA_REG_MISC_INT_MASK);
+	regmap_write(edma->regmap, EDMA_REG_MISC_INT_MASK, edma->soc->misc_int_mask);
 
-	edma_w32(edma, EDMA_PORT_PAD_EN | EDMA_PORT_EDMA_EN,
-		 EDMA_REG_PORT_CTRL);
+	regmap_write(edma->regmap, EDMA_REG_PORT_CTRL,
+		     EDMA_PORT_PAD_EN | EDMA_PORT_EDMA_EN);
 
 	edma_rings_enable(edma);
 
@@ -987,11 +1072,18 @@ static int edma_page_pool_create(struct edma *edma)
 	return PTR_ERR_OR_ZERO(edma->page_pool);
 }
 
+static const struct regmap_config edma_regmap_cfg = {
+	.reg_bits = 32,
+	.reg_stride = 4,
+	.val_bits = 32,
+};
+
 static int edma_probe(struct platform_device *pdev)
 {
 	struct clk_bulk_data *clks;
 	struct device *dev = &pdev->dev;
 	struct net_device *netdev;
+	void __iomem *base;
 	struct edma **priv;
 	struct edma *edma;
 	int ret;
@@ -1009,9 +1101,13 @@ static int edma_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
-	edma->reg_base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(edma->reg_base))
-		return PTR_ERR(edma->reg_base);
+	base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(base))
+		return dev_err_probe(dev, PTR_ERR(base), "failed to ioremap resource");
+
+	edma->regmap = devm_regmap_init_mmio(dev, base, &edma_regmap_cfg);
+	if (IS_ERR(edma->regmap))
+		return dev_err_probe(dev, PTR_ERR(edma->regmap), "failed to init regmap");
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
