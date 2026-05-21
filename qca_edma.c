@@ -328,8 +328,9 @@ static u32 edma_clean_rx(struct edma_priv *priv, int budget,
 	struct edma_rx_preheader *rxph;
 	struct edma_rxdesc *rxdesc;
 	struct sk_buff *skb;
-	u16 prod, cons;
+	INIT_HEAD(rx_list);
 	struct page *page;
+	u16 prod, cons;
 	u32 done = 0;
 	u32 src_port;
 	int pkt_len;
@@ -387,7 +388,7 @@ static u32 edma_clean_rx(struct edma_priv *priv, int budget,
 		tag_info->port = src_port;
 
 		dev_sw_netstats_rx_add(priv->netdev, pkt_len);
-		napi_gro_receive(&priv->rx_napi, skb);
+		list_add_tail(&skb->list, &rx_list);
 
 next:
 		if (++cons == rxdesc_ring->count)
@@ -397,6 +398,8 @@ next:
 	}
 
 	edma_rx_fill(priv, &priv->rxfill_ring);
+
+	netif_receive_skb_list(&rx_list);
 
 	wmb();
 	regmap_write(priv->regmap,
@@ -1163,7 +1166,6 @@ static int edma_probe(struct platform_device *pdev)
 	netdev->dev.of_node = dev->of_node;
 	eth_hw_addr_random(netdev);
 	netdev->netdev_ops = &edma_netdev_ops;
-	netdev->features = NETIF_F_GRO;
 	netdev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 	netdev->watchdog_timeo = 5 * HZ;
 	netdev->max_mtu = EDMA_RX_BUFFER_SIZE - ETH_HLEN - (2 * VLAN_HLEN);
